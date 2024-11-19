@@ -19,15 +19,12 @@ package org.apache.spark
 
 import java.util.{Collections => JCollections, HashSet => JHashSet}
 import java.util.concurrent.atomic.LongAdder
-
 import scala.collection.mutable.ArrayBuffer
 import scala.jdk.CollectionConverters._
-
 import org.mockito.ArgumentMatchers.any
 import org.mockito.Mockito._
 import org.mockito.invocation.InvocationOnMock
 import org.roaringbitmap.RoaringBitmap
-
 import org.apache.spark.LocalSparkContext._
 import org.apache.spark.broadcast.BroadcastManager
 import org.apache.spark.internal.config._
@@ -38,6 +35,8 @@ import org.apache.spark.rpc.{RpcAddress, RpcCallContext, RpcEndpoint, RpcEndpoin
 import org.apache.spark.scheduler.{CompressedMapStatus, HighlyCompressedMapStatus, MapStatus, MergeStatus}
 import org.apache.spark.shuffle.FetchFailedException
 import org.apache.spark.storage.{BlockManagerId, BlockManagerMasterEndpoint, ShuffleBlockId, ShuffleMergedBlockId}
+
+import scala.collection.Seq
 
 class MapOutputTrackerSuite extends SparkFunSuite with LocalSparkContext {
   private val conf = new SparkConf
@@ -80,6 +79,31 @@ class MapOutputTrackerSuite extends SparkFunSuite with LocalSparkContext {
         ArrayBuffer((ShuffleBlockId(10, 5, 0), size1000, 0))),
           (BlockManagerId("b", "hostB", 1000),
             ArrayBuffer((ShuffleBlockId(10, 6, 0), size10000, 1)))).toSet)
+    assert(0 == tracker.getNumCachedSerializedBroadcast)
+    tracker.stop()
+    rpcEnv.shutdown()
+  }
+
+  test("[aone-100942398] Optimize CompressedMapStatus]") {
+    val rpcEnv = createRpcEnv("test")
+    val tracker = newTrackerMaster()
+    tracker.trackerEndpoint = rpcEnv.setupEndpoint(MapOutputTracker.ENDPOINT_NAME,
+      new MapOutputTrackerMasterEndpoint(rpcEnv, tracker, conf))
+    conf.set(SHUFFLE_OPTIMIZE_COMPRESSED_MAP_STATUS.key, "true")
+    tracker.registerShuffle(10, 2, MergeStatus.SHUFFLE_PUSH_DUMMY_NUM_REDUCES)
+    assert(tracker.containsShuffle(10))
+    val size1000 = MapStatus.decompressSize(MapStatus.compressSize(1000L))
+    val size10000 = MapStatus.decompressSize(MapStatus.compressSize(10000L))
+    tracker.registerMapOutput(10, 0, MapStatus(BlockManagerId("a", "hostA", 1000),
+      Array(1000L, 10000L), 5))
+    tracker.registerMapOutput(10, 1, MapStatus(BlockManagerId("b", "hostB", 1000),
+      Array(10000L, 1000L), 6))
+    val statuses = tracker.getMapSizesByExecutorId(10, 0)
+    assert(statuses.toSet ===
+      Seq((BlockManagerId("a", "hostA", 1000),
+        ArrayBuffer((ShuffleBlockId(10, 5, 0), size1000, 0))),
+        (BlockManagerId("b", "hostB", 1000),
+          ArrayBuffer((ShuffleBlockId(10, 6, 0), size10000, 1)))).toSet)
     assert(0 == tracker.getNumCachedSerializedBroadcast)
     tracker.stop()
     rpcEnv.shutdown()
