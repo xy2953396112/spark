@@ -17,7 +17,7 @@
 
 package org.apache.spark.sql.execution
 
-import java.util.concurrent.{ConcurrentHashMap, ExecutorService, Future => JFuture}
+import java.util.concurrent.{CompletableFuture, ConcurrentHashMap, ExecutorService}
 import java.util.concurrent.atomic.AtomicLong
 
 import scala.jdk.CollectionConverters._
@@ -28,8 +28,9 @@ import org.apache.spark.SparkContext.{SPARK_JOB_DESCRIPTION, SPARK_JOB_INTERRUPT
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config.{SPARK_DRIVER_PREFIX, SPARK_EXECUTOR_PREFIX}
 import org.apache.spark.internal.config.Tests.IS_TESTING
-import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.classic.SparkSession
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec
+import org.apache.spark.sql.execution.exchange.ShuffleExchangeLike
 import org.apache.spark.sql.execution.ui.{SparkListenerSQLExecutionEnd, SparkListenerSQLExecutionStart}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.internal.StaticSQLConf.SQL_EVENT_TRUNCATE_LENGTH
@@ -178,8 +179,11 @@ object SQLExecution extends Logging {
                 val shuffleIds = queryExecution.executedPlan match {
                   case ae: AdaptiveSparkPlanExec =>
                     ae.context.shuffleIds.asScala.keys
-                  case _ =>
-                    Iterable.empty
+                  case nonAdaptivePlan =>
+                    nonAdaptivePlan.collect {
+                      case exec: ShuffleExchangeLike =>
+                        exec.shuffleId
+                    }
                 }
                 shuffleIds.foreach { shuffleId =>
                   queryExecution.shuffleCleanupMode match {
@@ -261,7 +265,7 @@ object SQLExecution extends Logging {
   }
 
   private[sql] def withSessionTagsApplied[T](sparkSession: SparkSession)(block: => T): T = {
-    val allTags = sparkSession.managedJobTags.values().asScala.toSet + sparkSession.sessionJobTag
+    val allTags = sparkSession.managedJobTags.get().values.toSet + sparkSession.sessionJobTag
     sparkSession.sparkContext.addJobTags(allTags)
 
     try {
@@ -301,7 +305,7 @@ object SQLExecution extends Logging {
    * SparkContext local properties are forwarded to execution thread
    */
   def withThreadLocalCaptured[T](
-      sparkSession: SparkSession, exec: ExecutorService) (body: => T): JFuture[T] = {
+      sparkSession: SparkSession, exec: ExecutorService) (body: => T): CompletableFuture[T] = {
     val activeSession = sparkSession
     val sc = sparkSession.sparkContext
     val localProps = Utils.cloneProperties(sc.getLocalProperties)
@@ -309,7 +313,7 @@ object SQLExecution extends Logging {
     // mode, we default back to the resources of the current Spark session.
     val artifactState = JobArtifactSet.getCurrentJobArtifactState.getOrElse(
       activeSession.artifactManager.state)
-    exec.submit(() => JobArtifactSet.withActiveJobArtifactState(artifactState) {
+    CompletableFuture.supplyAsync(() => JobArtifactSet.withActiveJobArtifactState(artifactState) {
       val originalSession = SparkSession.getActiveSession
       val originalLocalProps = sc.getLocalProperties
       SparkSession.setActiveSession(activeSession)
@@ -326,6 +330,6 @@ object SQLExecution extends Logging {
         SparkSession.clearActiveSession()
       }
       res
-    })
+    }, exec)
   }
 }

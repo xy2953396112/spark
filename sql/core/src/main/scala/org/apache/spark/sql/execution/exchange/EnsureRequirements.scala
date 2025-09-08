@@ -20,7 +20,7 @@ package org.apache.spark.sql.execution.exchange
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 
-import org.apache.spark.internal.{LogKeys, MDC}
+import org.apache.spark.internal.{LogKeys}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans._
@@ -64,7 +64,7 @@ case class EnsureRequirements(
     // Ensure that the operator's children satisfy their output distribution requirements.
     var children = originalChildren.zip(requiredChildDistributions).map {
       case (child, distribution) if child.outputPartitioning.satisfies(distribution) =>
-        child
+        ensureOrdering(child, distribution)
       case (child, BroadcastDistribution(mode)) =>
         BroadcastExchangeExec(mode, child)
       case (child, distribution) =>
@@ -290,6 +290,23 @@ case class EnsureRequirements(
     }
   }
 
+  private def ensureOrdering(plan: SparkPlan, distribution: Distribution) = {
+    (plan.outputPartitioning, distribution) match {
+      case (p @ KeyGroupedPartitioning(expressions, _, partitionValues, _),
+        d @ OrderedDistribution(ordering)) if p.satisfies(d) =>
+        val attrs = expressions.flatMap(_.collectLeaves()).map(_.asInstanceOf[Attribute])
+        val partitionOrdering: Ordering[InternalRow] = {
+          RowOrdering.create(ordering, attrs)
+        }
+        // Sort 'commonPartitionValues' and use this mechanism to ensure BatchScan's
+        // output partitions are ordered
+        val sorted = partitionValues.sorted(partitionOrdering)
+        populateCommonPartitionInfo(plan, sorted.map((_, 1)),
+          None, None, applyPartialClustering = false, replicatePartitions = false)
+      case _ => plan
+      }
+  }
+
   /**
    * Recursively reorders the join keys based on partitioning. It starts reordering the
    * join keys to match HashPartitioning on either side, followed by PartitioningCollection.
@@ -354,6 +371,26 @@ case class EnsureRequirements(
           left, right, isSkew)
 
       case other => other
+    }
+  }
+
+  /**
+   * Whether partial clustering can be applied to a given child query plan. This is true if the plan
+   * consists only of a sequence of unary nodes where each node does not use the scan's key-grouped
+   * partitioning to satisfy its required distribution. Otherwise, partially clustering could be
+   * applied to a key-grouped partitioning unrelated to this join.
+   */
+  private def canApplyPartialClusteredDistribution(plan: SparkPlan): Boolean = {
+    !plan.exists {
+      // Unary nodes are safe as long as they don't have a required distribution (for example, a
+      // project or filter). If they have a required distribution, then we should assume that this
+      // plan can't be partially clustered (since the key-grouped partitioning may be needed to
+      // satisfy this distribution unrelated to this JOIN).
+      case u if u.children.length == 1 =>
+        u.requiredChildDistribution.head != UnspecifiedDistribution
+      // Only allow a non-unary node if it's a leaf node - key-grouped partitionings other binary
+      // nodes (like another JOIN) aren't safe to partially cluster.
+      case other => other.children.nonEmpty
     }
   }
 
@@ -473,9 +510,16 @@ case class EnsureRequirements(
           // whether partially clustered distribution can be applied. For instance, the
           // optimization cannot be applied to a left outer join, where the left hand
           // side is chosen as the side to replicate partitions according to stats.
+          // Similarly, the partially clustered distribution cannot be applied if the
+          // partially clustered side must use the scan's key-grouped partitioning to
+          // satisfy some unrelated required distribution in its plan (for example, for an aggregate
+          // or window function), as this will give incorrect results (for example, duplicate
+          // row_number() values).
           // Otherwise, query result could be incorrect.
-          val canReplicateLeft = canReplicateLeftSide(joinType)
-          val canReplicateRight = canReplicateRightSide(joinType)
+          val canReplicateLeft = canReplicateLeftSide(joinType) &&
+            canApplyPartialClusteredDistribution(right)
+          val canReplicateRight = canReplicateRightSide(joinType) &&
+            canApplyPartialClusteredDistribution(left)
 
           if (!canReplicateLeft && !canReplicateRight) {
             logInfo(log"Skipping partially clustered distribution as it cannot be applied for " +

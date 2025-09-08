@@ -17,6 +17,7 @@
 
 package org.apache.spark.sql.execution.datasources
 
+import java.io.IOException
 import java.util.Locale
 
 import scala.jdk.CollectionConverters._
@@ -91,9 +92,14 @@ object DataSourceUtils extends PredicateHelper {
    * Verify if the schema is supported in datasource. This verification should be done
    * in a driver side.
    */
-  def verifySchema(format: FileFormat, schema: StructType): Unit = {
+  def verifySchema(format: FileFormat, schema: StructType, readOnly: Boolean = false): Unit = {
     schema.foreach { field =>
-      if (!format.supportDataType(field.dataType)) {
+      val supported = if (readOnly) {
+        format.supportReadDataType(field.dataType)
+      } else {
+        format.supportDataType(field.dataType)
+      }
+      if (!supported) {
         throw QueryCompilationErrors.dataTypeUnsupportedByDataSourceError(format.toString, field)
       }
     }
@@ -190,6 +196,11 @@ object DataSourceUtils extends PredicateHelper {
       case _ => throw SparkException.internalError(s"Unrecognized format $format.")
     }
     QueryExecutionErrors.sparkUpgradeInWritingDatesError(format, config)
+  }
+
+  def shouldIgnoreCorruptFileException(e: Throwable): Boolean = e match {
+    case _: RuntimeException | _: IOException | _: InternalError => true
+    case _ => false
   }
 
   def createDateRebaseFuncInRead(

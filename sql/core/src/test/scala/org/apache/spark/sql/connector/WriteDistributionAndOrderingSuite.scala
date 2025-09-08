@@ -35,7 +35,7 @@ import org.apache.spark.sql.execution.{QueryExecution, SortExec, SparkPlan}
 import org.apache.spark.sql.execution.adaptive.AQEShuffleReadExec
 import org.apache.spark.sql.execution.datasources.v2.V2TableWriteExec
 import org.apache.spark.sql.execution.exchange.ShuffleExchangeLike
-import org.apache.spark.sql.execution.streaming.MemoryStream
+import org.apache.spark.sql.execution.streaming.runtime.MemoryStream
 import org.apache.spark.sql.execution.streaming.sources.ContinuousMemoryStream
 import org.apache.spark.sql.functions.lit
 import org.apache.spark.sql.internal.SQLConf
@@ -70,7 +70,7 @@ class WriteDistributionAndOrderingSuite extends DistributionAndOrderingSuiteBase
   private val tableNameAsString = "testcat." + ident.toString
   private val emptyProps = Collections.emptyMap[String, String]
   private val columns = Array(
-    Column.create("id", IntegerType),
+    Column.create("id", LongType),
     Column.create("data", StringType),
     Column.create("day", DateType))
 
@@ -977,7 +977,8 @@ class WriteDistributionAndOrderingSuite extends DistributionAndOrderingSuiteBase
     )
     val distribution = Distributions.ordered(ordering)
 
-    catalog.createTable(ident, columns, Array.empty, emptyProps, distribution, ordering, None, None)
+    catalog.createTable(ident, columns, Array.empty, emptyProps,
+      distribution, ordering, None, None)
 
     withTempDir { checkpointDir =>
       val inputData = ContinuousMemoryStream[(Long, String, Date)]
@@ -1122,7 +1123,7 @@ class WriteDistributionAndOrderingSuite extends DistributionAndOrderingSuiteBase
         Seq.empty
       ),
       catalyst.expressions.SortOrder(
-        ApplyFunctionExpression(BucketFunction, Seq(Literal(10), Cast(attr("id"), LongType))),
+        ApplyFunctionExpression(BucketFunction, Seq(Literal(10), attr("id"))),
         catalyst.expressions.Descending,
         catalyst.expressions.NullsFirst,
         Seq.empty
@@ -1218,7 +1219,8 @@ class WriteDistributionAndOrderingSuite extends DistributionAndOrderingSuiteBase
     // scalastyle:on argcount
 
     catalog.createTable(ident, columns, Array.empty, emptyProps, tableDistribution,
-      tableOrdering, tableNumPartitions, tablePartitionSize, distributionStrictlyRequired)
+      tableOrdering, tableNumPartitions, tablePartitionSize, Array.empty,
+      distributionStrictlyRequired)
 
     val df = if (!dataSkewed) {
       spark.createDataFrame(Seq(
@@ -1320,7 +1322,7 @@ class WriteDistributionAndOrderingSuite extends DistributionAndOrderingSuiteBase
       expectAnalysisException: Boolean = false): Unit = {
 
     catalog.createTable(ident, columns, Array.empty, emptyProps, tableDistribution,
-      tableOrdering, tableNumPartitions, tablePartitionSize)
+      tableOrdering, tableNumPartitions, tablePartitionSize, Array.empty)
 
     withTempDir { checkpointDir =>
       val inputData = MemoryStream[(Long, String, Date)]

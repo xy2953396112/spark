@@ -126,6 +126,9 @@ case class DataSourceV2Relation(
       this
     }
   }
+
+  def autoSchemaEvolution(): Boolean =
+    table.capabilities().contains(TableCapability.AUTOMATIC_SCHEMA_EVOLUTION)
 }
 
 /**
@@ -204,7 +207,8 @@ case class StreamingDataSourceV2ScanRelation(
   override def name: String = relation.table.name()
 
   override def simpleString(maxFields: Int): String = {
-    s"StreamingDataSourceV2ScanRelation${truncatedString(output, "[", ", ", "]", maxFields)} $name"
+    statePrefix + "StreamingDataSourceV2ScanRelation" +
+      s"${truncatedString(output, "[", ", ", "]", maxFields)} $name"
   }
 
   override def isStreaming: Boolean = true

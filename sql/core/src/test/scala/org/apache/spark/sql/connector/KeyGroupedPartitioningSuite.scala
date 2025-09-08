@@ -370,6 +370,62 @@ class KeyGroupedPartitioningSuite extends DistributionAndOrderingSuiteBase {
     checkAnswer(df.sort("res"), Seq(Row(10.0), Row(15.5), Row(41.0)))
   }
 
+  test("SPARK-48655: order by on partition keys should not introduce additional shuffle") {
+    val items_partitions = Array(identity("price"), identity("id"))
+    createTable(items, itemsColumns, items_partitions)
+    sql(s"INSERT INTO testcat.ns.$items VALUES " +
+      s"(1, 'aa', 40.0, cast('2020-01-01' as timestamp)), " +
+      s"(1, 'aa', 41.0, cast('2020-01-02' as timestamp)), " +
+      s"(2, 'bb', 10.0, cast('2020-01-01' as timestamp)), " +
+      s"(3, 'cc', 15.5, cast('2020-02-01' as timestamp)), " +
+      s"(null, 'cc', 15.5, cast('2020-02-01' as timestamp)), " +
+      s"(3, 'cc', null, cast('2020-02-01' as timestamp))")
+
+    Seq(true, false).foreach { sortingEnabled =>
+      withSQLConf(SQLConf.V2_BUCKETING_SORTING_ENABLED.key -> sortingEnabled.toString) {
+
+        def verifyShuffle(cmd: String, answer: Seq[Row]): Unit = {
+          val df = sql(cmd)
+          if (sortingEnabled) {
+            assert(collectAllShuffles(df.queryExecution.executedPlan).isEmpty,
+              "should contain no shuffle when sorting by partition values")
+          } else {
+            assert(collectAllShuffles(df.queryExecution.executedPlan).size == 1,
+              "should contain one shuffle when optimization is disabled")
+          }
+          checkAnswer(df, answer)
+        }: Unit
+
+        verifyShuffle(
+          s"SELECT price, id FROM testcat.ns.$items ORDER BY price ASC, id ASC",
+          Seq(Row(null, 3), Row(10.0, 2), Row(15.5, null),
+            Row(15.5, 3), Row(40.0, 1), Row(41.0, 1)))
+
+        verifyShuffle(
+          s"SELECT price, id FROM testcat.ns.$items " +
+            s"ORDER BY price ASC NULLS LAST, id ASC NULLS LAST",
+          Seq(Row(10.0, 2), Row(15.5, 3), Row(15.5, null),
+            Row(40.0, 1), Row(41.0, 1), Row(null, 3)))
+
+        verifyShuffle(
+          s"SELECT price, id FROM testcat.ns.$items ORDER BY price DESC, id ASC",
+          Seq(Row(41.0, 1), Row(40.0, 1), Row(15.5, null),
+            Row(15.5, 3), Row(10.0, 2), Row(null, 3)))
+
+        verifyShuffle(
+          s"SELECT price, id FROM testcat.ns.$items ORDER BY price DESC, id DESC",
+          Seq(Row(41.0, 1), Row(40.0, 1), Row(15.5, 3),
+            Row(15.5, null), Row(10.0, 2), Row(null, 3)))
+
+        verifyShuffle(
+          s"SELECT price, id FROM testcat.ns.$items " +
+            s"ORDER BY price DESC NULLS FIRST, id DESC NULLS FIRST",
+          Seq(Row(null, 3), Row(41.0, 1), Row(40.0, 1),
+            Row(15.5, null), Row(15.5, 3), Row(10.0, 2)));
+      }
+    }
+  }
+
   test("SPARK-49179: Fix v2 multi bucketed inner joins throw AssertionError") {
     val cols = Array(
       Column.create("id", LongType),
@@ -1003,6 +1059,72 @@ class KeyGroupedPartitioningSuite extends DistributionAndOrderingSuiteBase {
               Row(1, "aa", 40.0, 45.0), Row(1, "aa", 41.0, null),
               Row(2, "bb", 10.0, 15.0), Row(3, "cc", 15.5, 20.0)))
           }
+      }
+    }
+  }
+
+  test("[SPARK-53074] partial clustering avoided to meet a non-JOIN required distribution") {
+    val items_partitions = Array(identity("id"))
+    createTable(items, itemsColumns, items_partitions)
+    sql(s"INSERT INTO testcat.ns.$items VALUES " +
+      "(1, 'aa', 40.0, cast('2020-01-01' as timestamp)), " +
+      "(1, 'aa', 40.0, cast('2020-01-01' as timestamp)), " +
+      "(2, 'bb', 10.0, cast('2020-01-01' as timestamp)), " +
+      "(3, 'cc', 15.5, cast('2020-02-01' as timestamp))")
+
+    val purchases_partitions = Array(identity("item_id"))
+    createTable(purchases, purchasesColumns, purchases_partitions)
+    sql(s"INSERT INTO testcat.ns.$purchases VALUES " +
+      "(1, 45.0, cast('2020-01-01' as timestamp)), " +
+      "(1, 50.0, cast('2020-01-02' as timestamp)), " +
+      "(2, 15.0, cast('2020-01-02' as timestamp)), " +
+      "(2, 20.0, cast('2020-01-03' as timestamp)), " +
+      "(3, 20.0, cast('2020-02-01' as timestamp))")
+
+    for {
+      pushDownValues <- Seq(true, false)
+      enable <- Seq("true", "false")
+    } yield {
+      withSQLConf(
+          SQLConf.REQUIRE_ALL_CLUSTER_KEYS_FOR_CO_PARTITION.key -> false.toString,
+          SQLConf.V2_BUCKETING_PUSH_PART_VALUES_ENABLED.key -> pushDownValues.toString,
+          SQLConf.V2_BUCKETING_PARTIALLY_CLUSTERED_DISTRIBUTION_ENABLED.key -> enable) {
+        // The left side uses a key-grouped partitioning to satisfy the WINDOW function's
+        // required distribution. By default, the left side will be partially clustered (since
+        // it's estimated to be larger), but this partial clustering won't be applied because the
+        // left side needs to be key-grouped partitioned to satisfy the WINDOW's required
+        // distribution.
+        // The left side needs to project additional fields to ensure it's estimated to be
+        // larger than the right side.
+        val df = sql(
+          s"""
+             |WITH purchases_windowed AS (
+             |  SELECT
+             |    ROW_NUMBER() OVER (
+             |      PARTITION BY item_id ORDER BY time DESC
+             |    ) AS RN,
+             |    item_id,
+             |    price,
+             |    STRUCT(item_id, price, time) AS purchases_struct
+             |  FROM testcat.ns.$purchases
+             |)
+             |SELECT
+             |  SUM(p.price),
+             |  SUM(p.purchases_struct.item_id),
+             |  SUM(p.purchases_struct.price),
+             |  MAX(p.purchases_struct.time)
+             |FROM
+             |  purchases_windowed p JOIN testcat.ns.$items i
+             |  ON i.id = p.item_id
+             |WHERE p.RN = 1
+             |""".stripMargin)
+        checkAnswer(df, Seq(Row(140.0, 7, 140.0, Timestamp.valueOf("2020-02-01 00:00:00"))))
+        val shuffles = collectShuffles(df.queryExecution.executedPlan)
+        assert(shuffles.isEmpty, "should not contain any shuffle")
+        if (pushDownValues) {
+          val scans = collectScans(df.queryExecution.executedPlan)
+          assert(scans.forall(_.inputRDD.partitions.length === 3))
+        }
       }
     }
   }

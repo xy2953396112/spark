@@ -19,7 +19,8 @@ package org.apache.spark.sql.execution.streaming.state
 
 import org.apache.spark.sql.Encoders
 import org.apache.spark.sql.catalyst.encoders.{encoderFor, ExpressionEncoder}
-import org.apache.spark.sql.execution.streaming.{ImplicitGroupingKeyTracker, TimerStateImpl}
+import org.apache.spark.sql.execution.streaming.operators.stateful.transformwithstate.statefulprocessor.ImplicitGroupingKeyTracker
+import org.apache.spark.sql.execution.streaming.operators.stateful.transformwithstate.timers.TimerStateImpl
 import org.apache.spark.sql.streaming.TimeMode
 
 /**
@@ -72,8 +73,9 @@ class TimerSuite extends StateVariableSuiteBase {
       assert(timerState1.listTimers().toSet === Set(15000L, 1000L))
       assert(timerState1.getExpiredTimers(Long.MaxValue).toSeq ===
         Seq(("test_key", 1000L), ("test_key", 15000L)))
-      // if timestamp equals to expiryTimestampsMs, will not considered expired
-      assert(timerState1.getExpiredTimers(15000L).toSeq === Seq(("test_key", 1000L)))
+      // if timestamp equals to expiryTimestampsMs, it will be considered expired
+      assert(timerState1.getExpiredTimers(15000L).toSeq ===
+        Seq(("test_key", 1000L), ("test_key", 15000L)))
       assert(timerState1.listTimers().toSet === Set(15000L, 1000L))
 
       timerState1.registerTimer(20L * 1000)
@@ -128,7 +130,7 @@ class TimerSuite extends StateVariableSuiteBase {
       timerTimerstamps.foreach(timerState.registerTimer)
       assert(timerState.getExpiredTimers(Long.MaxValue).toSeq.map(_._2) === timerTimerstamps.sorted)
       assert(timerState.getExpiredTimers(4200L).toSeq.map(_._2) ===
-        timerTimerstamps.sorted.takeWhile(_ < 4200L))
+        timerTimerstamps.sorted.takeWhile(_ <= 4200L))
       assert(timerState.getExpiredTimers(Long.MinValue).toSeq === Seq.empty)
       ImplicitGroupingKeyTracker.removeImplicitKey()
     }
@@ -162,7 +164,7 @@ class TimerSuite extends StateVariableSuiteBase {
         (timerTimestamps1 ++ timerTimestamps2 ++ timerTimerStamps3).sorted)
       assert(timerState1.getExpiredTimers(Long.MinValue).toSeq === Seq.empty)
       assert(timerState1.getExpiredTimers(8000L).toSeq.map(_._2) ===
-        (timerTimestamps1 ++ timerTimestamps2 ++ timerTimerStamps3).sorted.takeWhile(_ < 8000L))
+        (timerTimestamps1 ++ timerTimestamps2 ++ timerTimerStamps3).sorted.takeWhile(_ <= 8000L))
     }
   }
 
